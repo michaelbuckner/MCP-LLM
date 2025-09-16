@@ -22,16 +22,32 @@ from fastapi import HTTPException
 # Import anyio for proper error handling
 import anyio
 
-# Configure logging to suppress MCP internal errors and focus on our handling
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy MCP internal logging
-logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
-logging.getLogger("mcp.server").setLevel(logging.WARNING)
+# --- Aggressive Error Suppression Filter ---
+class SuppressClosedResourceErrorFilter(logging.Filter):
+    def filter(self, record):
+        """
+        Filter out the specific "Error in message router" log record
+        that is associated with an anyio.ClosedResourceError.
+        """
+        # Check if the log message is the one we want to suppress
+        if "Error in message router" in record.getMessage():
+            # Check if there's exception info and if it's a ClosedResourceError
+            if record.exc_info:
+                exc_type, exc_value, exc_traceback = record.exc_info
+                if exc_type is anyio.ClosedResourceError:
+                    return False  # Suppress this log record
+        return True # Allow all other log records
+
+# Apply the filter to the specific logger that is producing the error
+mcp_stream_logger = logging.getLogger("mcp.server.streamable_http")
+mcp_stream_logger.addFilter(SuppressClosedResourceErrorFilter())
 
 # --- Config ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")

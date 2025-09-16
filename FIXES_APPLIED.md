@@ -69,19 +69,29 @@ async def auth_middleware(request, call_next):
 - Added logging for successful operations
 - Returns error information instead of raising exceptions
 
-### 4. Enhanced Logging and Error Suppression
-```python
-# Configure logging to suppress MCP internal errors and focus on our handling
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+### 4. Aggressive Error Suppression
+To completely prevent the `ClosedResourceError` from appearing in the logs, a custom logging filter was implemented.
 
-# Suppress noisy MCP internal logging
-logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
-logging.getLogger("mcp.server").setLevel(logging.WARNING)
+```python
+# --- Aggressive Error Suppression Filter ---
+class SuppressClosedResourceErrorFilter(logging.Filter):
+    def filter(self, record):
+        """
+        Filter out the specific "Error in message router" log record
+        that is associated with an anyio.ClosedResourceError.
+        """
+        if "Error in message router" in record.getMessage():
+            if record.exc_info:
+                exc_type, exc_value, exc_traceback = record.exc_info
+                if exc_type is anyio.ClosedResourceError:
+                    return False  # Suppress this log record
+        return True # Allow all other log records
+
+# Apply the filter to the specific logger that is producing the error
+mcp_stream_logger = logging.getLogger("mcp.server.streamable_http")
+mcp_stream_logger.addFilter(SuppressClosedResourceErrorFilter())
 ```
+This filter inspects the exception information of each log record and specifically suppresses the "Error in message router" log that is associated with an `anyio.ClosedResourceError`.
 
 ### 5. Application-Level Error Handling
 ```python
