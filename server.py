@@ -10,6 +10,10 @@ from mcp import ServerSession
 # OpenAI client (async)
 from openai import AsyncOpenAI
 
+# Import Middleware support from FastAPI/Starlette
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+
 # --- Config ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -45,6 +49,42 @@ mcp = FastMCP(
     instructions="A single-tool server that relays prompts to OpenAI and returns the response."
 )
 
+
+# --- FIXES FOR NON-COMPLIANT CLIENT ---
+
+# 1. Add CORS middleware to handle OPTIONS requests from browsers.
+# This should generally be the first middleware added.
+mcp.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# 2. Add custom middleware to fix missing/incorrect Accept headers.
+async def force_accept_header_middleware(request: Request, call_next):
+    """
+    Checks for requests to MCP endpoints and ensures an appropriate
+    'Accept' header is present to prevent '406 Not Acceptable' errors.
+    """
+    if request.url.path == '/mcp':
+        # FastMCP's streamable_http transport requires a specific Accept header.
+        # If the client doesn't send one, we'll add a default.
+        if 'accept' not in request.headers:
+            # Use a mutable copy of headers
+            headers = dict(request.scope['headers'])
+            headers[b'accept'] = b'application/x-ndjson'
+            request.scope['headers'] = [(k, v) for k, v in headers.items()]
+
+    response = await call_next(request)
+    return response
+
+mcp.add_middleware(force_accept_header_middleware)
+
+# -----------------------------------------
+
+
 # Add authentication middleware for HTTP transports
 async def auth_middleware(request, call_next):
     """Middleware to authenticate MCP client requests."""
@@ -69,8 +109,9 @@ async def auth_middleware(request, call_next):
     # For non-HTTP transports (like stdio), allow through
     return await call_next(request)
 
-# Add the middleware to the server
+# Add the authentication middleware to the server
 mcp.add_middleware(auth_middleware)
+
 
 # Allow host/port to be configured via env without needing custom ASGI glue.
 # (Default mount paths: SSE at /sse, Streamable HTTP at /mcp)
