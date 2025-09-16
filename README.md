@@ -210,6 +210,13 @@ docker rm openai-mcp-server
 1. **Server won't start**: Check that your `OPENAI_API_KEY` is set correctly
 2. **Connection refused**: Ensure the port 8000 is not being used by another service
 3. **API errors**: Verify your OpenAI API key has sufficient credits and permissions
+4. **Docker/Cloud deployment issues**: 
+   - The server binds to `0.0.0.0` by default for container compatibility
+   - For local development, you can override with `HOST=127.0.0.1`
+   - Ensure your cloud platform allows the configured port (default: 8000)
+5. **Authentication failures**: 
+   - Check that the `Authorization: Bearer <key>` or `X-API-Key: <key>` header is included
+   - Verify the API key matches the one displayed in server logs or set via `MCP_API_KEY`
 
 ## License
 

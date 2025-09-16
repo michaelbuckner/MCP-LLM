@@ -74,7 +74,7 @@ mcp.add_middleware(auth_middleware)
 
 # Allow host/port to be configured via env without needing custom ASGI glue.
 # (Default mount paths: SSE at /sse, Streamable HTTP at /mcp)
-settings.host = os.getenv("HOST", "127.0.0.1")
+settings.host = os.getenv("HOST", "0.0.0.0")
 settings.port = int(os.getenv("PORT", "8000"))
 
 @mcp.tool()
