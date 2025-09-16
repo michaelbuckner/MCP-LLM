@@ -20,7 +20,8 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware import Middleware
-from fastapi import HTTPException
+# HTTP utilities
+# (FastAPI fully re-exports Starlette responses, so stick to Starlette primitives)
 
 # Import anyio for proper error handling
 import anyio
@@ -138,7 +139,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if api_key and verify_api_key(api_key):
             return await call_next(request)
 
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        logger.warning("Unauthorized access attempt to %s", request.url.path)
+        return JSONResponse(
+            {"error": "Invalid or missing API key"},
+            status_code=401,
+        )
 
 
 # Allow host/port to be configured via env without needing custom ASGI glue.
