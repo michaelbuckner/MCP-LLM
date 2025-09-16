@@ -1,4 +1,6 @@
 # server.py
+import base64
+import binascii
 import os
 from typing import Optional, Dict, Any
 import secrets
@@ -127,19 +129,58 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if request.url.path not in {"/mcp", "/sse"}:
             return await call_next(request)
 
-        # Authorization: Bearer <token>
-        auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            api_key = auth_header[7:]
-            if verify_api_key(api_key):
+        candidate_keys: list[str] = []
+        provided_schemes: list[str] = []
+
+        def register_candidate(value: Optional[str], source: str) -> None:
+            if not value:
+                return
+            stripped = value.strip()
+            if not stripped:
+                return
+            candidate_keys.append(stripped)
+            provided_schemes.append(source)
+
+        auth_header = request.headers.get("authorization")
+        if auth_header:
+            normalized = auth_header.strip()
+            lower_normalized = normalized.lower()
+            if lower_normalized.startswith("bearer "):
+                register_candidate(normalized[7:], "bearer")
+            elif lower_normalized.startswith("basic "):
+                token = normalized[6:].strip()
+                try:
+                    decoded = base64.b64decode(token, validate=True).decode("utf-8")
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    decoded = ""
+                if decoded:
+                    if ":" in decoded:
+                        username, password = decoded.split(":", 1)
+                        register_candidate(username, "basic-username")
+                        register_candidate(password, "basic-password")
+                    else:
+                        register_candidate(decoded, "basic")
+            else:
+                register_candidate(normalized, "authorization")
+
+        # Alternate header names used by some clients
+        for header_name in ("x-api-key", "api-key", "mcp-api-key"):
+            register_candidate(request.headers.get(header_name), header_name)
+
+        # Query string fallbacks (?api_key=...)
+        for param_name in ("api_key", "key", "token"):
+            register_candidate(request.query_params.get(param_name), f"query:{param_name}")
+
+        for candidate in candidate_keys:
+            if verify_api_key(candidate):
                 return await call_next(request)
 
-        # Alternative header
-        api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-        if api_key and verify_api_key(api_key):
-            return await call_next(request)
-
-        logger.warning("Unauthorized access attempt to %s", request.url.path)
+        unique_schemes = list(dict.fromkeys(provided_schemes)) or ["none"]
+        logger.warning(
+            "Unauthorized access attempt to %s (schemes=%s)",
+            request.url.path,
+            unique_schemes,
+        )
         return JSONResponse(
             {"error": "Invalid or missing API key"},
             status_code=401,

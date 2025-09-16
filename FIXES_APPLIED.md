@@ -12,7 +12,7 @@ Container health checks expected `/health` to respond with 200s, but the default
 
 - Introduced a dedicated Starlette middleware stack:
   - `ErrorHandlingMiddleware` converts disconnects into 499 responses and shields unexpected exceptions with a JSON 500.
-  - `AuthMiddleware` enforces bearer or `X-API-Key` authentication on `/mcp` and `/sse`, while allowing `/` and `/health` probes.
+  - `AuthMiddleware` enforces authentication on `/mcp` and `/sse`, accepting Bearer, Basic, raw `Authorization`, `X-API-Key`-style headers, and `?api_key=` fallbacks while allowing `/` and `/health` probes.
   - `ForceAcceptHeaderMiddleware` rewrites `/mcp` requests to advertise both `application/json` and `text/event-stream`, satisfying the MCP transport requirements for legacy clients.
 - Registered the middleware with `FastMCP.run_async(..., middleware=HTTP_MIDDLEWARE)` so every HTTP transport benefits from the fixes.
 - Added a lightweight `/health` route via `FastMCP.custom_route` for container orchestration.
