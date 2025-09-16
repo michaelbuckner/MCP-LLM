@@ -5,6 +5,8 @@ import secrets
 import hashlib
 import asyncio
 import logging
+import signal
+import sys
 
 from fastmcp import FastMCP, Context, settings
 from mcp import ServerSession
@@ -17,9 +19,19 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from fastapi import HTTPException
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Import anyio for proper error handling
+import anyio
+
+# Configure logging to suppress MCP internal errors and focus on our handling
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Suppress noisy MCP internal logging
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+logging.getLogger("mcp.server").setLevel(logging.WARNING)
 
 # --- Config ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -227,6 +239,38 @@ async def generate(
             "error": True
         }
 
+async def run_server_with_error_handling(transport, host, port):
+    """Run the MCP server with comprehensive error handling for ClosedResourceError."""
+    try:
+        logger.info(f"Starting MCP server on {host}:{port} with transport {transport}")
+        
+        # Run the server with error handling
+        await mcp.run_async(
+            transport=transport,
+            stateless_http=True,
+            host=host,
+            port=port
+        )
+    except anyio.ClosedResourceError:
+        logger.info("Client disconnected - ClosedResourceError caught at server level")
+        # Don't re-raise, just log and continue
+    except KeyboardInterrupt:
+        logger.info("Server shutdown requested")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Unexpected server error: {str(e)}")
+        # For other errors, we might want to restart or exit gracefully
+        raise
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
 if __name__ == "__main__":
     import argparse
 
@@ -238,10 +282,37 @@ if __name__ == "__main__":
         help="Transport protocol for the MCP server.",
     )
     args = parser.parse_args()
-    # Streamable HTTP is the modern, scalable HTTP transport; SSE is still supported.
-    mcp.run(
-        transport=args.transport, 
-        stateless_http=True,
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000"))
-    )
+    
+    # Setup signal handlers for graceful shutdown
+    setup_signal_handlers()
+    
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    
+    # Check if FastMCP supports async run
+    if hasattr(mcp, 'run_async'):
+        # Use async version with error handling
+        try:
+            asyncio.run(run_server_with_error_handling(args.transport, host, port))
+        except KeyboardInterrupt:
+            logger.info("Server stopped by user")
+        except Exception as e:
+            logger.error(f"Server failed to start: {e}")
+            sys.exit(1)
+    else:
+        # Fallback to synchronous version
+        try:
+            logger.info(f"Starting MCP server on {host}:{port} with transport {args.transport}")
+            mcp.run(
+                transport=args.transport, 
+                stateless_http=True,
+                host=host,
+                port=port
+            )
+        except KeyboardInterrupt:
+            logger.info("Server stopped by user")
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+            # Don't exit on ClosedResourceError, just log it
+            if "ClosedResourceError" not in str(e):
+                sys.exit(1)

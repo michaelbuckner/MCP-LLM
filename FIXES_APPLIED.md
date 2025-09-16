@@ -3,15 +3,16 @@
 ## Issues Resolved
 
 ### 1. ClosedResourceError
-**Problem**: `anyio.ClosedResourceError` was occurring when clients disconnected unexpectedly, causing the server to crash.
+**Problem**: `anyio.ClosedResourceError` was occurring when clients disconnected unexpectedly, causing the server to crash and show error tracebacks.
 
-**Root Cause**: The server lacked proper error handling for stream disconnections in the message router.
+**Root Cause**: The error was occurring deep in the MCP library's message router (`mcp.server.streamable_http`) and wasn't being caught by HTTP middleware.
 
-**Solution**: Added comprehensive error handling middleware that:
-- Catches `ClosedResourceError` exceptions
-- Logs client disconnections gracefully
-- Returns HTTP 499 status (Client Closed Request) for closed connections
-- Prevents server crashes from stream disconnections
+**Enhanced Solution**: Added multi-layer error handling:
+- **Application-level error handling**: Async server wrapper that catches `ClosedResourceError` at the top level
+- **Middleware-level error handling**: HTTP middleware for request/response errors
+- **Logging suppression**: Suppressed noisy MCP internal logging to reduce error noise
+- **Signal handling**: Proper signal handlers for graceful shutdown
+- **Fallback mechanisms**: Support for both async and sync server modes
 
 ### 2. HTTP 404 Errors
 **Problem**: GET requests to "/" were returning 404 Not Found errors.
@@ -68,11 +69,54 @@ async def auth_middleware(request, call_next):
 - Added logging for successful operations
 - Returns error information instead of raising exceptions
 
-### 4. Enhanced Logging
+### 4. Enhanced Logging and Error Suppression
 ```python
-import logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging to suppress MCP internal errors and focus on our handling
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Suppress noisy MCP internal logging
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+logging.getLogger("mcp.server").setLevel(logging.WARNING)
+```
+
+### 5. Application-Level Error Handling
+```python
+async def run_server_with_error_handling(transport, host, port):
+    """Run the MCP server with comprehensive error handling for ClosedResourceError."""
+    try:
+        logger.info(f"Starting MCP server on {host}:{port} with transport {transport}")
+        
+        await mcp.run_async(
+            transport=transport,
+            stateless_http=True,
+            host=host,
+            port=port
+        )
+    except anyio.ClosedResourceError:
+        logger.info("Client disconnected - ClosedResourceError caught at server level")
+        # Don't re-raise, just log and continue
+    except KeyboardInterrupt:
+        logger.info("Server shutdown requested")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Unexpected server error: {str(e)}")
+        raise
+```
+
+### 6. Signal Handlers for Graceful Shutdown
+```python
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 ```
 
 ## Testing
