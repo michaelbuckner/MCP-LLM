@@ -126,4 +126,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     # Streamable HTTP is the modern, scalable HTTP transport; SSE is still supported.
-    mcp.run(transport=args.transport, stateless_http=True)
+    mcp.run(
+        transport=args.transport, 
+        stateless_http=True,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000"))
+    )
