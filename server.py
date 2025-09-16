@@ -18,6 +18,8 @@ from openai import AsyncOpenAI
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.datastructures import MutableHeaders
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware import Middleware
 from fastapi import HTTPException
 
 # Import anyio for proper error handling
@@ -66,92 +68,77 @@ mcp = FastMCP(
 )
 
 
-# --- FIXES FOR NON-COMPLIANT CLIENT ---
+# --- HTTP middleware for compatibility and robustness ---
 
-# --- Force Accept Header Middleware ---
-async def force_accept_header_middleware(request: Request, call_next):
-    """
-    Forcefully injects the correct Accept header for the /mcp endpoint
-    to resolve 406 Not Acceptable errors with non-compliant clients.
-    """
-    if request.url.path == '/mcp':
-        headers = MutableHeaders(scope=request.scope)
-        accept_header = headers.get('accept', '')
-        accept_values = [value.strip() for value in accept_header.split(',') if value.strip()]
-        normalized = {value.lower() for value in accept_values}
+class ForceAcceptHeaderMiddleware(BaseHTTPMiddleware):
+    """Ensure POST /mcp requests advertise the media types required by MCP."""
 
-        updated = False
-        if 'application/json' not in normalized:
-            accept_values.append('application/json')
-            updated = True
-        if 'text/event-stream' not in normalized:
-            accept_values.append('text/event-stream')
-            updated = True
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if request.scope.get("type") == "http" and request.url.path == "/mcp":
+            headers = MutableHeaders(scope=request.scope)
+            accept_header = headers.get("accept", "")
+            accept_values = [value.strip() for value in accept_header.split(",") if value.strip()]
+            normalized = {value.lower() for value in accept_values}
 
-        if updated:
-            headers['accept'] = ', '.join(accept_values)
+            updated = False
+            if "application/json" not in normalized:
+                accept_values.append("application/json")
+                updated = True
+            if "text/event-stream" not in normalized:
+                accept_values.append("text/event-stream")
+                updated = True
 
-    response = await call_next(request)
-    return response
+            if updated:
+                headers["accept"] = ", ".join(accept_values)
+                logger.debug("Adjusted Accept header for /mcp request: %s", headers["accept"])
 
-mcp.add_middleware(force_accept_header_middleware)
-
-# -----------------------------------------
-
-
-# Error handling middleware to catch stream disconnections
-async def error_handling_middleware(request, call_next):
-    """Middleware to handle stream disconnections and other errors gracefully."""
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        # Log the error for debugging
-        logger.error(f"Error in request processing: {str(e)}")
-        
-        # Handle specific error types
-        if "ClosedResourceError" in str(type(e)) or "anyio.ClosedResourceError" in str(e):
-            logger.info("Client disconnected - stream closed")
-            # Return a 499 status (Client Closed Request) for closed connections
-            return PlainTextResponse("Client disconnected", status_code=499)
-        
-        # For other errors, return a generic 500 error
-        return JSONResponse(
-            content={"error": "Internal server error", "detail": str(e)},
-            status_code=500
-        )
-
-mcp.add_middleware(error_handling_middleware)
-
-# Add authentication middleware for HTTP transports
-async def auth_middleware(request, call_next):
-    """Middleware to authenticate MCP client requests."""
-    # Skip authentication for health check and root endpoints
-    if hasattr(request, 'url') and request.url.path in ['/health', '/']:
         return await call_next(request)
-    
-    # Check if this is an HTTP request with headers
-    if hasattr(request, 'headers'):
-        # Check Authorization header
-        auth_header = request.headers.get('authorization', '') or request.headers.get('Authorization', '')
-        if auth_header.startswith('Bearer '):
-            api_key = auth_header[7:]  # Remove 'Bearer ' prefix
+
+
+class ErrorHandlingMiddleware(BaseHTTPMiddleware):
+    """Convert transport exceptions into friendly HTTP responses."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        try:
+            return await call_next(request)
+        except anyio.ClosedResourceError:
+            logger.info("Client disconnected - ClosedResourceError handled by middleware")
+            return PlainTextResponse("Client disconnected", status_code=499)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.error("Error in request processing: %s", exc, exc_info=True)
+            return JSONResponse(
+                content={"error": "Internal server error", "detail": str(exc)},
+                status_code=500,
+            )
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Authenticate HTTP requests hitting MCP endpoints."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if request.scope.get("type") != "http":
+            return await call_next(request)
+
+        if request.url.path in {"/health", "/"}:
+            return await call_next(request)
+
+        # Only enforce auth for MCP HTTP transports
+        if request.url.path not in {"/mcp", "/sse"}:
+            return await call_next(request)
+
+        # Authorization: Bearer <token>
+        auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            api_key = auth_header[7:]
             if verify_api_key(api_key):
                 return await call_next(request)
-        
-        # Check X-API-Key header as alternative
-        api_key = request.headers.get('x-api-key', '') or request.headers.get('X-API-Key', '')
+
+        # Alternative header
+        api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
         if api_key and verify_api_key(api_key):
             return await call_next(request)
-        
-        # Return 401 Unauthorized if no valid API key
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    
-    # For non-HTTP transports (like stdio), allow through
-    return await call_next(request)
 
-# Add the authentication middleware to the server
-mcp.add_middleware(auth_middleware)
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # Allow host/port to be configured via env without needing custom ASGI glue.
@@ -239,17 +226,33 @@ async def generate(
             "error": True
         }
 
+HTTP_MIDDLEWARE = [
+    Middleware(ErrorHandlingMiddleware),
+    Middleware(AuthMiddleware),
+    Middleware(ForceAcceptHeaderMiddleware),
+]
+
+
 async def run_server_with_error_handling(transport, host, port):
     """Run the MCP server with comprehensive error handling for ClosedResourceError."""
     try:
         logger.info(f"Starting MCP server on {host}:{port} with transport {transport}")
         
+        transport_kwargs = {}
+        if transport in {"http", "streamable-http", "sse"}:
+            transport_kwargs.update(
+                {
+                    "stateless_http": True,
+                    "host": host,
+                    "port": port,
+                    "middleware": HTTP_MIDDLEWARE,
+                }
+            )
+
         # Run the server with error handling
         await mcp.run_async(
             transport=transport,
-            stateless_http=True,
-            host=host,
-            port=port
+            **transport_kwargs,
         )
     except anyio.ClosedResourceError:
         logger.info("Client disconnected - ClosedResourceError caught at server level")

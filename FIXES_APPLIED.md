@@ -2,168 +2,27 @@
 
 ## Issues Resolved
 
-### 1. ClosedResourceError
-**Problem**: `anyio.ClosedResourceError` was occurring when clients disconnected unexpectedly, causing the server to crash and show error tracebacks.
+### ClosedResourceError noise
+Non-compliant MCP HTTP clients would fail the Accept negotiation, trigger a 406 response, and tear down the stream. The resulting disconnect bubbled up as `anyio.ClosedResourceError`, cluttering the logs.
 
-**Root Cause**: The error was occurring deep in the MCP library's message router (`mcp.server.streamable_http`) and wasn't being caught by HTTP middleware.
+### Missing health endpoint
+Container health checks expected `/health` to respond with 200s, but the default FastMCP app did not ship that route.
 
-**Enhanced Solution**: Added multi-layer error handling:
-- **Application-level error handling**: Async server wrapper that catches `ClosedResourceError` at the top level
-- **Middleware-level error handling**: HTTP middleware for request/response errors
-- **Logging suppression**: Suppressed noisy MCP internal logging to reduce error noise
-- **Signal handling**: Proper signal handlers for graceful shutdown
-- **Fallback mechanisms**: Support for both async and sync server modes
+## Key Changes
 
-### 2. HTTP 404 Errors
-**Problem**: GET requests to "/" were returning 404 Not Found errors.
+- Introduced a dedicated Starlette middleware stack:
+  - `ErrorHandlingMiddleware` converts disconnects into 499 responses and shields unexpected exceptions with a JSON 500.
+  - `AuthMiddleware` enforces bearer or `X-API-Key` authentication on `/mcp` and `/sse`, while allowing `/` and `/health` probes.
+  - `ForceAcceptHeaderMiddleware` rewrites `/mcp` requests to advertise both `application/json` and `text/event-stream`, satisfying the MCP transport requirements for legacy clients.
+- Registered the middleware with `FastMCP.run_async(..., middleware=HTTP_MIDDLEWARE)` so every HTTP transport benefits from the fixes.
+- Added a lightweight `/health` route via `FastMCP.custom_route` for container orchestration.
 
-**Root Cause**: FastMCP focuses on MCP protocol endpoints and doesn't provide default HTTP routes.
+## Operational Notes
 
-**Solution**: 
-- Added error handling middleware to gracefully handle 404s
-- Enhanced authentication middleware to skip auth for health check endpoints
-- Documented that 404s on non-MCP endpoints are acceptable for an MCP server
-
-### 3. Enhanced Error Handling
-**Improvements Made**:
-- Added comprehensive logging configuration
-- Enhanced the `generate` function with input validation
-- Added graceful error handling that returns error information instead of raising exceptions
-- Improved ServiceNow compatibility with better Accept header handling
-
-## Code Changes
-
-### 1. Added Error Handling Middleware
-```python
-async def error_handling_middleware(request, call_next):
-    """Middleware to handle stream disconnections and other errors gracefully."""
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        logger.error(f"Error in request processing: {str(e)}")
-        
-        if "ClosedResourceError" in str(type(e)) or "anyio.ClosedResourceError" in str(e):
-            logger.info("Client disconnected - stream closed")
-            return PlainTextResponse("Client disconnected", status_code=499)
-        
-        return JSONResponse(
-            content={"error": "Internal server error", "detail": str(e)},
-            status_code=500
-        )
-```
-
-### 2. Enhanced Authentication Middleware
-```python
-async def auth_middleware(request, call_next):
-    """Middleware to authenticate MCP client requests."""
-    # Skip authentication for health check and root endpoints
-    if hasattr(request, 'url') and request.url.path in ['/health', '/']:
-        return await call_next(request)
-    # ... rest of authentication logic
-```
-
-### 3. Improved Generate Function
-- Added input validation for prompt, temperature, and max_tokens
-- Enhanced error handling with try-catch blocks
-- Added logging for successful operations
-- Returns error information instead of raising exceptions
-
-### 4. Aggressive Error Suppression
-To completely prevent the `ClosedResourceError` from appearing in the logs, a custom logging filter was implemented.
-
-```python
-# --- Aggressive Error Suppression Filter ---
-class SuppressClosedResourceErrorFilter(logging.Filter):
-    def filter(self, record):
-        """
-        Filter out the specific "Error in message router" log record
-        that is associated with an anyio.ClosedResourceError.
-        """
-        if "Error in message router" in record.getMessage():
-            if record.exc_info:
-                exc_type, exc_value, exc_traceback = record.exc_info
-                if exc_type is anyio.ClosedResourceError:
-                    return False  # Suppress this log record
-        return True # Allow all other log records
-
-# Apply the filter to the specific logger that is producing the error
-mcp_stream_logger = logging.getLogger("mcp.server.streamable_http")
-mcp_stream_logger.addFilter(SuppressClosedResourceErrorFilter())
-```
-This filter inspects the exception information of each log record and specifically suppresses the "Error in message router" log that is associated with an `anyio.ClosedResourceError`.
-
-### 5. Application-Level Error Handling
-```python
-async def run_server_with_error_handling(transport, host, port):
-    """Run the MCP server with comprehensive error handling for ClosedResourceError."""
-    try:
-        logger.info(f"Starting MCP server on {host}:{port} with transport {transport}")
-        
-        await mcp.run_async(
-            transport=transport,
-            stateless_http=True,
-            host=host,
-            port=port
-        )
-    except anyio.ClosedResourceError:
-        logger.info("Client disconnected - ClosedResourceError caught at server level")
-        # Don't re-raise, just log and continue
-    except KeyboardInterrupt:
-        logger.info("Server shutdown requested")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Unexpected server error: {str(e)}")
-        raise
-```
-
-### 6. Signal Handlers for Graceful Shutdown
-```python
-def setup_signal_handlers():
-    """Setup signal handlers for graceful shutdown."""
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-```
+- The middleware stack only runs for HTTP/SSE transports; stdio mode remains unchanged.
+- Authentication still hashes the configured API key and compares with constant-time checks.
+- Logging now captures disconnects at INFO level instead of surfacing full stack traces.
 
 ## Testing
 
-Created comprehensive test suite (`test_fixes.py`) that verifies:
-- Server imports successfully
-- Error handling functions work correctly
-- Logging is properly configured
-- Authentication mechanisms function as expected
-
-All tests pass successfully, confirming the fixes are working correctly.
-
-## Benefits
-
-1. **Improved Stability**: Server no longer crashes on client disconnections
-2. **Better Debugging**: Enhanced logging provides better visibility into issues
-3. **Graceful Error Handling**: Errors are handled gracefully without breaking the service
-4. **Enhanced Compatibility**: Better support for various MCP clients including ServiceNow
-5. **Robust Authentication**: Authentication system works reliably with proper bypass for health checks
-
-## Deployment
-
-The fixes are backward compatible and don't require any configuration changes. The server will:
-- Continue to work with existing MCP clients
-- Handle disconnections gracefully
-- Provide better error information for debugging
-- Maintain all existing functionality while being more robust
-
-## Monitoring
-
-The enhanced logging will help monitor:
-- Client connection/disconnection events
-- Authentication attempts
-- Error conditions
-- Server performance
-
-Log messages include:
-- `INFO`: Client disconnections, successful operations
-- `ERROR`: Server errors, authentication failures
-- Debug information for troubleshooting
+- `pytest` (unit tests for authentication, binding, and Accept-header handling)
