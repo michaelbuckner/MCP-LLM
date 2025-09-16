@@ -3,6 +3,8 @@ import os
 from typing import Optional, Dict, Any
 import secrets
 import hashlib
+import asyncio
+import logging
 
 from fastmcp import FastMCP, Context, settings
 from mcp import ServerSession
@@ -12,6 +14,12 @@ from openai import AsyncOpenAI
 
 # Import Request for middleware
 from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+from fastapi import HTTPException
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Config ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -85,9 +93,37 @@ mcp.add_middleware(servicenow_compatibility_middleware)
 # -----------------------------------------
 
 
+# Error handling middleware to catch stream disconnections
+async def error_handling_middleware(request, call_next):
+    """Middleware to handle stream disconnections and other errors gracefully."""
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        # Log the error for debugging
+        logger.error(f"Error in request processing: {str(e)}")
+        
+        # Handle specific error types
+        if "ClosedResourceError" in str(type(e)) or "anyio.ClosedResourceError" in str(e):
+            logger.info("Client disconnected - stream closed")
+            # Return a 499 status (Client Closed Request) for closed connections
+            return PlainTextResponse("Client disconnected", status_code=499)
+        
+        # For other errors, return a generic 500 error
+        return JSONResponse(
+            content={"error": "Internal server error", "detail": str(e)},
+            status_code=500
+        )
+
+mcp.add_middleware(error_handling_middleware)
+
 # Add authentication middleware for HTTP transports
 async def auth_middleware(request, call_next):
     """Middleware to authenticate MCP client requests."""
+    # Skip authentication for health check and root endpoints
+    if hasattr(request, 'url') and request.url.path in ['/health', '/']:
+        return await call_next(request)
+    
     # Check if this is an HTTP request with headers
     if hasattr(request, 'headers'):
         # Check Authorization header
@@ -103,7 +139,6 @@ async def auth_middleware(request, call_next):
             return await call_next(request)
         
         # Return 401 Unauthorized if no valid API key
-        from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     
     # For non-HTTP transports (like stdio), allow through
@@ -117,6 +152,10 @@ mcp.add_middleware(auth_middleware)
 # (Default mount paths: SSE at /sse, Streamable HTTP at /mcp)
 settings.host = os.getenv("HOST", "0.0.0.0")
 settings.port = int(os.getenv("PORT", "8000"))
+
+# Note: FastMCP handles routing internally for MCP endpoints
+# Health check and root endpoints will be handled by the error middleware
+# if they return 404, which is acceptable for an MCP server
 
 @mcp.tool()
 async def generate(
@@ -138,22 +177,55 @@ async def generate(
     Returns:
       { "text": str, "model": str, "finish_reason": str }
     """
-    if ctx:
-        await ctx.info(f"Dispatching prompt to OpenAI with model={model}")
+    try:
+        if ctx:
+            await ctx.info(f"Dispatching prompt to OpenAI with model={model}")
 
-    # Use Chat Completions for widest compatibility
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        **(extra or {}),
-    )
-    choice = resp.choices[0]
-    text = (choice.message.content or "").strip()
-    finish = choice.finish_reason or "stop"
+        # Validate input parameters
+        if not prompt or not prompt.strip():
+            raise ValueError("Prompt cannot be empty")
+        
+        if temperature < 0 or temperature > 2:
+            raise ValueError("Temperature must be between 0 and 2")
+        
+        if max_tokens is not None and max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
 
-    return {"text": text, "model": model, "finish_reason": finish}
+        # Use Chat Completions for widest compatibility
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **(extra or {}),
+        )
+        
+        if not resp.choices:
+            raise RuntimeError("No response choices returned from OpenAI")
+        
+        choice = resp.choices[0]
+        text = (choice.message.content or "").strip()
+        finish = choice.finish_reason or "stop"
+
+        if ctx:
+            await ctx.info(f"Successfully generated response with finish_reason: {finish}")
+
+        return {"text": text, "model": model, "finish_reason": finish}
+    
+    except Exception as e:
+        error_msg = f"Error generating response: {str(e)}"
+        logger.error(error_msg)
+        
+        if ctx:
+            await ctx.error(error_msg)
+        
+        # Return error information instead of raising to prevent stream disconnection
+        return {
+            "text": f"Error: {str(e)}",
+            "model": model,
+            "finish_reason": "error",
+            "error": True
+        }
 
 if __name__ == "__main__":
     import argparse
