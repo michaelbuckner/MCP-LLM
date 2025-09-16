@@ -21,3 +21,17 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  proxy-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    ports:
+      - "8001:8001"
+    environment:
+      - TARGET_HOST=http://openai-mcp-server:8000
+      - PROXY_PORT=8001
+      - MCP_API_KEY=${MCP_API_KEY:-}
+    depends_on:
+      - openai-mcp-server
+    restart: unless-stopped

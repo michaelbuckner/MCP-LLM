@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 # Import Request for middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.datastructures import MutableHeaders
 from fastapi import HTTPException
 
 # Import anyio for proper error handling
@@ -28,26 +29,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# --- Aggressive Error Suppression Filter ---
-class SuppressClosedResourceErrorFilter(logging.Filter):
-    def filter(self, record):
-        """
-        Filter out the specific "Error in message router" log record
-        that is associated with an anyio.ClosedResourceError.
-        """
-        # Check if the log message is the one we want to suppress
-        if "Error in message router" in record.getMessage():
-            # Check if there's exception info and if it's a ClosedResourceError
-            if record.exc_info:
-                exc_type, exc_value, exc_traceback = record.exc_info
-                if exc_type is anyio.ClosedResourceError:
-                    return False  # Suppress this log record
-        return True # Allow all other log records
-
-# Apply the filter to the specific logger that is producing the error
-mcp_stream_logger = logging.getLogger("mcp.server.streamable_http")
-mcp_stream_logger.addFilter(SuppressClosedResourceErrorFilter())
 
 # --- Config ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -87,36 +68,33 @@ mcp = FastMCP(
 
 # --- FIXES FOR NON-COMPLIANT CLIENT ---
 
-# Custom middleware to fix missing/incorrect Accept headers for ServiceNow compatibility
-async def servicenow_compatibility_middleware(request, call_next):
+# --- Force Accept Header Middleware ---
+async def force_accept_header_middleware(request: Request, call_next):
     """
-    Middleware to handle ServiceNow MCP client compatibility issues.
-    Modifies Accept headers to prevent 406 errors.
+    Forcefully injects the correct Accept header for the /mcp endpoint
+    to resolve 406 Not Acceptable errors with non-compliant clients.
     """
-    if hasattr(request, 'url') and request.url.path == '/mcp':
-        # Check if Accept header is missing or only contains application/json
-        accept_header = request.headers.get('accept', '')
-        
-        if not accept_header or accept_header == 'application/json':
-            # Modify the request headers to include both required types
-            # This is a workaround for ServiceNow's limited Accept header
-            if hasattr(request, 'scope'):
-                headers = dict(request.scope.get('headers', []))
-                # Add the required Accept header for FastMCP
-                headers[b'accept'] = b'application/json, text/event-stream'
-                request.scope['headers'] = list(headers.items())
-    
+    if request.url.path == '/mcp':
+        headers = MutableHeaders(scope=request.scope)
+        accept_header = headers.get('accept', '')
+        accept_values = [value.strip() for value in accept_header.split(',') if value.strip()]
+        normalized = {value.lower() for value in accept_values}
+
+        updated = False
+        if 'application/json' not in normalized:
+            accept_values.append('application/json')
+            updated = True
+        if 'text/event-stream' not in normalized:
+            accept_values.append('text/event-stream')
+            updated = True
+
+        if updated:
+            headers['accept'] = ', '.join(accept_values)
+
     response = await call_next(request)
-    
-    # Add CORS headers for browser compatibility
-    if hasattr(response, 'headers'):
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = '*'
-    
     return response
 
-mcp.add_middleware(servicenow_compatibility_middleware)
+mcp.add_middleware(force_accept_header_middleware)
 
 # -----------------------------------------
 
@@ -180,6 +158,12 @@ mcp.add_middleware(auth_middleware)
 # (Default mount paths: SSE at /sse, Streamable HTTP at /mcp)
 settings.host = os.getenv("HOST", "0.0.0.0")
 settings.port = int(os.getenv("PORT", "8000"))
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request):
+    """Simple health check used by container orchestration."""
+    return JSONResponse({"status": "ok"})
 
 # Note: FastMCP handles routing internally for MCP endpoints
 # Health check and root endpoints will be handled by the error middleware
