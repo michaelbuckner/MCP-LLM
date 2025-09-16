@@ -1,3 +1,5 @@
 fastmcp==2.12.3
 mcp==1.14.0
 openai
+fastapi
+starlette
