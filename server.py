@@ -10,8 +10,7 @@ from mcp import ServerSession
 # OpenAI client (async)
 from openai import AsyncOpenAI
 
-# Import Middleware support from FastAPI/Starlette
-from fastapi.middleware.cors import CORSMiddleware
+# Import Request for middleware
 from starlette.requests import Request
 
 # --- Config ---
@@ -52,35 +51,36 @@ mcp = FastMCP(
 
 # --- FIXES FOR NON-COMPLIANT CLIENT ---
 
-# 1. Add CORS middleware to handle OPTIONS requests from browsers.
-# This should generally be the first middleware added.
-mcp.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
-
-# 2. Add custom middleware to fix missing/incorrect Accept headers.
-async def force_accept_header_middleware(request: Request, call_next):
+# Custom middleware to fix missing/incorrect Accept headers for ServiceNow compatibility
+async def servicenow_compatibility_middleware(request, call_next):
     """
-    Checks for requests to MCP endpoints and ensures an appropriate
-    'Accept' header is present to prevent '406 Not Acceptable' errors.
+    Middleware to handle ServiceNow MCP client compatibility issues.
+    Modifies Accept headers to prevent 406 errors.
     """
-    if request.url.path == '/mcp':
-        # FastMCP's streamable_http transport requires a specific Accept header.
-        # If the client doesn't send one, we'll add a default.
-        if 'accept' not in request.headers:
-            # Use a mutable copy of headers
-            headers = dict(request.scope['headers'])
-            headers[b'accept'] = b'application/x-ndjson'
-            request.scope['headers'] = [(k, v) for k, v in headers.items()]
-
+    if hasattr(request, 'url') and request.url.path == '/mcp':
+        # Check if Accept header is missing or only contains application/json
+        accept_header = request.headers.get('accept', '')
+        
+        if not accept_header or accept_header == 'application/json':
+            # Modify the request headers to include both required types
+            # This is a workaround for ServiceNow's limited Accept header
+            if hasattr(request, 'scope'):
+                headers = dict(request.scope.get('headers', []))
+                # Add the required Accept header for FastMCP
+                headers[b'accept'] = b'application/json, text/event-stream'
+                request.scope['headers'] = list(headers.items())
+    
     response = await call_next(request)
+    
+    # Add CORS headers for browser compatibility
+    if hasattr(response, 'headers'):
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = '*'
+    
     return response
 
-mcp.add_middleware(force_accept_header_middleware)
+mcp.add_middleware(servicenow_compatibility_middleware)
 
 # -----------------------------------------
 
